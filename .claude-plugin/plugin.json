@@ -1,0 +1,19 @@
+{
+  "name": "feishu-super-skills",
+  "version": "0.1.0",
+  "description": "飞书多维表格高阶 OpenAPI 操作技能 — Python 原生（uv 管理），支持 App 扫表、字段探查、筛选/排序/模糊搜索，增删改带权限围栏",
+  "license": "MIT",
+  "author": {
+    "name": "feishu-super-skills contributors"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "飞书",
+    "多维表格",
+    "bitable",
+    "openapi",
+    "uv",
+    "python"
+  ]
+}
