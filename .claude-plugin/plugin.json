@@ -1,7 +1,7 @@
 {
   "name": "feishu-super-skills",
-  "version": "0.1.0",
-  "description": "飞书多维表格高阶 OpenAPI 操作技能 — Python 原生（uv 管理），支持 App 扫表、字段探查、筛选/排序/模糊搜索，增删改带权限围栏",
+  "version": "0.2.0",
+  "description": "飞书多维表格高阶 OpenAPI 操作技能 — Python 原生（uv 管理）：Link 字段自动展开（含 linked_records）、日期语义筛选（DateTime 范围）、权限围栏的 CRUD、高阶查询 DSL",
   "license": "MIT",
   "author": {
     "name": "feishu-super-skills contributors"

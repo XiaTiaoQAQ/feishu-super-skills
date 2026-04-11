@@ -16,10 +16,17 @@ from feishu_super.commands._common import (
     resolve_app_token,
 )
 from feishu_super.commands.fields import _fetch_all_fields
+from feishu_super.date_range import (
+    DateRangeError,
+    build_date_range,
+    filter_records_by_date,
+)
+from feishu_super.expand import expand_links
 from feishu_super.field_types import is_text_like
-from feishu_super.formatters import emit_json, emit_warn, summarize_records
+from feishu_super.formatters import emit_error, emit_json, emit_warn, summarize_records
 from feishu_super.guard import guard_write
-from feishu_super.where_dsl import build_fuzzy_filter, parse_sort, parse_where
+from feishu_super.schema import TableSchema, get_table_schema
+from feishu_super.where_dsl import DslError, build_fuzzy_filter, parse_sort, parse_where
 
 app = typer.Typer(help="多维表格「记录」读写与查询", no_args_is_help=True)
 
@@ -58,6 +65,20 @@ def _search_page(
     ).get("data") or {}
 
 
+def _maybe_expand(
+    client: LarkClient,
+    app_token: str,
+    table_id: str,
+    records: list[dict[str, Any]],
+    no_expand: bool,
+) -> list[dict[str, Any]]:
+    """Apply Link expansion unless the user explicitly opted out."""
+    if no_expand or not records:
+        return records
+    schema = get_table_schema(client, app_token, table_id)
+    return expand_links(client, app_token, records, schema)
+
+
 # -------- read commands --------
 
 @app.command("list")
@@ -69,6 +90,7 @@ def list_records(
     page_size: int = typer.Option(DEFAULT_PAGE_SIZE, "--page-size"),
     fetch_all: bool = typer.Option(False, "--all", help="自动分页聚合全部记录"),
     limit_show: int = typer.Option(10, "--show", help="JSON 输出中展示前 N 条"),
+    no_expand: bool = typer.Option(False, "--no-expand", help="关闭 Link 字段自动补齐（records/list 本身已完整，此处为对称支持）"),
 ) -> None:
     """分页列出记录（不带筛选）。"""
     token = resolve_app_token(ctx, app_token)
@@ -77,6 +99,7 @@ def list_records(
             lambda pt: _list_page(client, token, table_id, page_size, pt),
             fetch_all,
         )
+        items = _maybe_expand(client, token, table_id, items, no_expand)
     emit_json(summarize_records(items, limit=limit_show))
 
 
@@ -87,12 +110,17 @@ def get_record(
     table_id: str = typer.Argument(...),
     record_id: str = typer.Argument(...),
     app_token: Optional[str] = typer.Option(None, "--app-token", "-a"),
+    no_expand: bool = typer.Option(False, "--no-expand"),
 ) -> None:
     """读取单条记录。"""
     token = resolve_app_token(ctx, app_token)
     with build_client(ctx) as client:
         data = client.get(f"{_records_base(token, table_id)}/{record_id}")
-    emit_json(data.get("data", {}))
+        payload = data.get("data") or {}
+        rec = payload.get("record")
+        if rec:
+            _maybe_expand(client, token, table_id, [rec], no_expand)
+    emit_json(payload)
 
 
 @app.command("search")
@@ -110,16 +138,72 @@ def search_records(
     fetch_all: bool = typer.Option(False, "--all"),
     limit_show: int = typer.Option(10, "--show"),
     client_fuzzy: bool = typer.Option(False, "--client-fuzzy", help="在客户端做模糊过滤而非服务端"),
+    no_expand: bool = typer.Option(False, "--no-expand", help="关闭 Link 字段自动补齐"),
+    date_field: Optional[str] = typer.Option(None, "--date-field", help="用于日期语义筛选的 DateTime 字段名"),
+    date_on: Optional[str] = typer.Option(None, "--date-on", help="筛选某一天 (YYYY-MM-DD)"),
+    date_range_spec: Optional[str] = typer.Option(None, "--date-range", help="筛选区间 START..END (YYYY-MM-DD 或毫秒)"),
+    date_today: bool = typer.Option(False, "--date-today", help="筛选今天（按 --tz）"),
+    date_tomorrow: bool = typer.Option(False, "--date-tomorrow", help="筛选明天（按 --tz）"),
+    date_yesterday: bool = typer.Option(False, "--date-yesterday", help="筛选昨天（按 --tz）"),
+    tz: Optional[str] = typer.Option(None, "--tz", help="时区名（IANA），默认 Asia/Shanghai"),
 ) -> None:
-    """核心查询命令：支持原生 filter、简化 DSL、排序、字段选择、模糊搜索、自动分页。"""
+    """核心查询命令：支持原生 filter、简化 DSL、排序、字段选择、模糊搜索、日期语义、自动分页。
+
+    关于日期筛选：飞书 records/search 对 DateTime 字段的范围 filter
+    (isGreater/isLess/...) 会返回 code=1254018 InvalidFilter。请使用
+    --date-field + --date-on/--date-range/--date-today/--date-tomorrow
+    这组参数，本命令会自动在客户端做区间过滤。
+    """
     token = resolve_app_token(ctx, app_token)
+
+    # Parse date-semantic params upfront so we fail fast on bad input.
+    try:
+        date_range = build_date_range(
+            tz_name=tz,
+            on=date_on,
+            range_spec=date_range_spec,
+            today=date_today,
+            tomorrow=date_tomorrow,
+            yesterday=date_yesterday,
+        )
+    except DateRangeError as e:
+        emit_error(f"日期参数错误: {e}")
+        raise typer.Exit(code=2)
+
+    if date_range and not date_field:
+        emit_error("指定日期参数时必须同时提供 --date-field <字段名>")
+        raise typer.Exit(code=2)
+
+    # Pre-pull schema if we need DSL type-checking or date-field validation.
+    # Schema is cached per (client, table) so repeated access is free.
+    schema: TableSchema | None = None
+    if where or date_range:
+        with build_client(ctx) as probe:
+            schema = get_table_schema(probe, token, table_id)
+        if date_range and date_field:
+            ftype = schema.field_type(date_field)
+            if ftype is None:
+                emit_error(f"--date-field {date_field!r} 在表 {table_id} 中不存在")
+                raise typer.Exit(code=2)
+            if ftype != 5:
+                emit_error(
+                    f"--date-field {date_field!r} 的类型是 {ftype}，不是 DateTime (5)。"
+                    "日期语义参数仅支持 DateTime 字段。"
+                )
+                raise typer.Exit(code=2)
+
+    field_types_for_dsl = {n: m.type for n, m in schema.by_name.items()} if schema else None
 
     # Resolve filter
     filter_obj: dict[str, Any] | None = None
     if filter_json:
         filter_obj = json.loads(filter_json)
     elif where:
-        filter_obj = parse_where(where)
+        try:
+            filter_obj = parse_where(where, field_types=field_types_for_dsl)
+        except DslError as e:
+            emit_error(f"--where DSL 错误: {e}")
+            raise typer.Exit(code=2)
 
     body: dict[str, Any] = {}
     if filter_obj:
@@ -128,6 +212,21 @@ def search_records(
         body["sort"] = parse_sort(sort_spec)
     if fields_spec:
         body["field_names"] = [s.strip() for s in fields_spec.split(",") if s.strip()]
+
+    # Date range is a post-filter: search runs normally, then we drop records
+    # whose date_field falls outside the range. This requires exhaustive
+    # pagination — otherwise the first 100 search hits might all fall outside
+    # the range and we'd return nothing. Auto-force fetch_all.
+    if date_range and not fetch_all:
+        emit_warn(
+            f"[i] 日期筛选 ({date_range.label}) 需要遍历全部记录；已自动开启 --all"
+        )
+        fetch_all = True
+    # Date-filter scans can legitimately need to walk tens of thousands of
+    # rows. The default paginate_all cap (50 pages × 100 rows = 5 000) is too
+    # low for that case, so raise it when the user is intentionally asking
+    # for exhaustive date scanning.
+    paginate_max_pages = 1000 if date_range else None
 
     # Strategy for --fuzzy:
     #   - No pre-existing filter: fold the fuzzy OR-contains filter into body["filter"]
@@ -144,37 +243,40 @@ def search_records(
         if client_fuzzy:
             apply_client_fuzzy = True
         elif filter_obj:
-            # Keep user filter server-side, fuzzy goes client-side.
             apply_client_fuzzy = True
             emit_warn(
                 "[i] --fuzzy 与 --where/--filter 同时指定：服务端仅执行过滤条件，"
                 "模糊搜索在客户端对结果集二次过滤。"
             )
-        else:
-            with build_client(ctx) as client:
-                text_field_names = _fetch_text_field_names(client, token, table_id)
-                fuzzy_filter = build_fuzzy_filter(fuzzy, text_field_names)
-                if fuzzy_filter:
-                    body["filter"] = fuzzy_filter
-                else:
-                    # No text-like fields exist — fall back to client-side.
-                    apply_client_fuzzy = True
-                items = paginate_all(
-                    lambda pt: _search_page(client, token, table_id, body, page_size, pt),
-                    fetch_all,
-                )
-            if apply_client_fuzzy:
-                items = _client_fuzzy_filter(items, fuzzy)
-            emit_json(summarize_records(items, limit=limit_show))
-            return
 
     with build_client(ctx) as client:
+        # If fuzzy is the ONLY filter, fold it into body server-side.
+        if fuzzy and not client_fuzzy and not filter_obj:
+            text_field_names = _fetch_text_field_names(client, token, table_id)
+            fuzzy_filter = build_fuzzy_filter(fuzzy, text_field_names)
+            if fuzzy_filter:
+                body["filter"] = fuzzy_filter
+            else:
+                apply_client_fuzzy = True
+
+        paginate_kwargs: dict[str, Any] = {}
+        if paginate_max_pages is not None:
+            paginate_kwargs["max_pages"] = paginate_max_pages
         items = paginate_all(
             lambda pt: _search_page(client, token, table_id, body, page_size, pt),
             fetch_all,
+            **paginate_kwargs,
         )
-    if fuzzy and apply_client_fuzzy:
-        items = _client_fuzzy_filter(items, fuzzy)
+        if fuzzy and apply_client_fuzzy:
+            items = _client_fuzzy_filter(items, fuzzy)
+        if date_range and date_field:
+            before = len(items)
+            items = filter_records_by_date(items, date_field, date_range)
+            emit_warn(
+                f"[i] 日期筛选保留 {len(items)}/{before} 条记录"
+            )
+        items = _maybe_expand(client, token, table_id, items, no_expand)
+
     emit_json(summarize_records(items, limit=limit_show))
 
 

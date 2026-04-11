@@ -1,16 +1,19 @@
 ---
 name: feishu-super-skills
-description: "飞书多维表格高阶 OpenAPI 技能 — Python 原生（uv 管理），支持 App 扫表、字段探查、筛选/排序/模糊搜索，增删改带强制权限围栏"
-version: 0.1.0
+description: "飞书多维表格高阶 OpenAPI 技能 — Python 原生（uv 管理）：Link 字段自动展开、日期语义筛选、写操作权限围栏"
+version: 0.2.0
 ---
 
 # feishu-super-skills
 
-一个聚焦「飞书多维表格（Bitable）」的 Skill，Python + uv 实现，面向 LLM agent 场景。三大卖点：
+一个聚焦「飞书多维表格（Bitable）」的 Skill，Python + uv 实现，面向 LLM agent 场景。
 
-- **Python 原生实现**：无外部 CLI 依赖，`uv sync` 即装即跑
-- **高阶查询能力**：原生 filter JSON、简化 `--where` DSL、`--sort`、`--fields` 字段投影、`--fuzzy` 跨字段模糊搜索、`--all` 自动聚合分页
-- **写操作权限围栏**：CLI 层面强制要求 `--confirm`，未带 flag 时打印预览并退出码 2，防止 LLM 擅自写入
+**四大特性**：
+
+- **Link 字段自动展开**（0.2 新）：`records search / list / get` 默认对所有 SingleLink / DuplexLink 字段自动补齐 `text`，并把目标表该行的**完整字段**作为 `linked_records` 嵌入返回。跨表取值无需再调 `records get`，彻底解决"查客户需要再查储值余额、查记录需要再查服务名称"的老问题
+- **日期语义参数**（0.2 新）：`--date-field / --date-on / --date-range / --date-today / --date-tomorrow / --date-yesterday / --tz Asia/Shanghai`，绕开飞书 `records/search` 对 DateTime 字段范围 filter 不支持的限制
+- **高阶查询**：原生 filter JSON、简化 `--where` DSL（DateTime 字段误用范围操作符会**提前报错**）、`--sort`、`--fields` 投影、`--fuzzy` 跨字段模糊搜索、`--all` 自动分页（带截断警告）
+- **写操作权限围栏**：CLI 层面强制要求 `--confirm`，未带 flag 时打印 DRY RUN 预览并退出码 2，防止 LLM 擅自写入
 
 ## 触发场景
 
@@ -49,19 +52,40 @@ uv run feishu-super tables list --app-token <APP_TOKEN>
 
 ```
 feishu-super env                                                  # 环境诊断
-feishu-super tables list  [--app-token T] [--name 关键词]          # 列表
+feishu-super tables list  [--app-token T] [--name 关键词]
 feishu-super tables get <table_id>
 feishu-super fields list  <table_id> [--name X] [--type 1]        # 字段探查
-feishu-super records list  <table_id> [--all] [--show 10]
-feishu-super records get   <table_id> <record_id>
+feishu-super records list  <table_id> [--all] [--show 10] [--no-expand]
+feishu-super records get   <table_id> <record_id> [--no-expand]
 feishu-super records search <table_id> \                          # 核心查询
     [--filter '<raw_json>']         # 完整 Feishu filter JSON
     [--where 'name contains "abc" and status = active']  # 简化 DSL
     [--sort 'created_time desc,name asc']
     [--fields 'f1,f2,f3']           # 字段投影
-    [--fuzzy '关键词']              # 所有文本字段 OR contains
-    [--all] [--show 20] [--client-fuzzy]
+    [--fuzzy '关键词']              # 文本字段 OR contains 模糊搜索
+    [--date-field 日期 --date-tomorrow --tz Asia/Shanghai]   # 日期语义
+    [--date-field 日期 --date-on 2026-04-11]
+    [--date-field 日期 --date-range 2026-04-01..2026-04-30]
+    [--all] [--show 20] [--client-fuzzy] [--no-expand]
 ```
+
+**Link 字段自动展开**（默认开启）：所有 `records search / list / get` 返回的
+SingleLink/DuplexLink 字段会自动补齐成：
+
+```json
+"教练": [{
+  "record_ids": ["rec..."],
+  "table_id": "tbl...",
+  "text": "田阳",
+  "linked_records": [{
+    "record_id": "rec...",
+    "fields": { /* 目标表该条记录全部字段 */ }
+  }]
+}]
+```
+
+下游脚本读 `fields["上课人"][0]["linked_records"][0]["fields"]["储值余额（元）"]`
+即可拿到客户储值余额，**不必再调 records get**。加 `--no-expand` 关闭。
 
 ### 增 / 删 / 改（**必须走权限围栏**）
 

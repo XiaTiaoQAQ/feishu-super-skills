@@ -46,6 +46,15 @@ _OP_MAP: dict[str, str] = {
 
 _UNARY_OPS = {"is_empty", "is_not_empty"}
 
+# Operators that Feishu `records/search` REJECTS for DateTime (type=5) fields
+# with `code=1254018 InvalidFilter`. If the caller hands us a field-type map
+# and the DSL tries one of these on a DateTime field, raise upfront with a
+# helpful message instead of sending a doomed request. Use --date-range etc.
+# for date filtering.
+_DATETIME_INCOMPATIBLE_OPS: frozenset[str] = frozenset(
+    {">", ">=", "<", "<=", "isGreater", "isGreaterEqual", "isLess", "isLessEqual"}
+)
+
 _CONJ = {"and", "or", "AND", "OR", "And", "Or"}
 
 
@@ -118,8 +127,17 @@ def _unquote(raw: str) -> str:
     return "".join(out)
 
 
-def parse_where(expr: str) -> dict[str, Any]:
-    """Parse a `--where` string into Feishu search filter JSON."""
+def parse_where(
+    expr: str,
+    field_types: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Parse a `--where` string into Feishu search filter JSON.
+
+    If `field_types` is provided (field_name → type_code), we preflight-check
+    that no range operator is used against a DateTime field (type=5), since
+    Feishu would reject it with `code=1254018 InvalidFilter`. Raising early
+    lets the CLI guide the user to `--date-range` instead.
+    """
     expr = expr.strip()
     if not expr:
         raise DslError("DSL 为空")
@@ -142,6 +160,16 @@ def parse_where(expr: str) -> dict[str, Any]:
         if op_raw not in _OP_MAP:
             raise DslError(f"不支持的操作符 {op_raw!r}")
         op_feishu = _OP_MAP[op_raw]
+
+        if field_types is not None:
+            ftype = field_types.get(field_name)
+            if ftype == 5 and op_raw in _DATETIME_INCOMPATIBLE_OPS:
+                raise DslError(
+                    f"字段 {field_name!r} 是 DateTime (type=5)，"
+                    f"飞书 records/search 不支持对日期字段使用范围操作符 {op_raw!r}"
+                    "（会返回 InvalidFilter）。请改用 --date-on/--date-range/"
+                    "--date-today/--date-tomorrow 等语义参数。"
+                )
         i += 1
 
         cond: dict[str, Any] = {"field_name": field_name, "operator": op_feishu}
