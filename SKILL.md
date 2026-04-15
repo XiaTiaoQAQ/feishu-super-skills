@@ -1,18 +1,21 @@
 ---
 name: feishu-super-skills
-description: "飞书多维表格高阶 OpenAPI 技能 — Python 原生（uv 管理）：Link 字段自动展开、日期语义筛选、写操作权限围栏"
-version: 0.2.0
+description: "飞书多维表格高阶 OpenAPI 技能 — Python 原生（uv 管理）：Link 字段自动展开（并发拉取 + 白名单精控）、日期语义筛选、写操作权限围栏"
+version: 0.3.0
 ---
 
 # feishu-super-skills
 
 一个聚焦「飞书多维表格（Bitable）」的 Skill，Python + uv 实现，面向 LLM agent 场景。
 
-**四大特性**：
+**核心特性**：
 
 - **Link 字段自动展开**（0.2 新）：`records search / list / get` 默认对所有 SingleLink / DuplexLink 字段自动补齐 `text`，并把目标表该行的**完整字段**作为 `linked_records` 嵌入返回。跨表取值无需再调 `records get`，彻底解决"查客户需要再查储值余额、查记录需要再查服务名称"的老问题
+- **多目标表并发 expand**（0.3 新）：expand 内部对多张目标表使用 `ThreadPoolExecutor` 并发拉取（默认 4 worker），受限于最慢单表。同时整体性能大幅提升：`page_size` 默认 500（飞书真上限）、`MAX_PAGES` 200（100k 行默认 ceiling）、`schema_cache` 跨 client 复用，服务器实测 11 分钟级报表 → ~50 秒（~13× 加速）
+- **`--expand-only` 字段白名单**（0.3 新）：`records list/search/get` 支持 `--expand-only 上课人,会员卡`，只展开指定的 link 字段，跳过其它。用于源表有 6 个 link 字段但只需要 1~2 个的场景，避免无谓的目标表全表拉取 + stdout JSON 膨胀。字段名 / 字段类型 fail-fast 校验（不存在 / 非 SingleLink 都 exit 2），与 `--no-expand` 互斥
 - **日期语义参数**（0.2 新）：`--date-field / --date-on / --date-range / --date-today / --date-tomorrow / --date-yesterday / --tz Asia/Shanghai`，绕开飞书 `records/search` 对 DateTime 字段范围 filter 不支持的限制
-- **高阶查询**：原生 filter JSON、简化 `--where` DSL（DateTime 字段误用范围操作符会**提前报错**）、`--sort`、`--fields` 投影、`--fuzzy` 跨字段模糊搜索、`--all` 自动分页（带截断警告）
+- **线程安全**（0.3 新）：`LarkClient._get_token` 用 RLock + 双检锁保护（fast path 仍无锁），`token_cache.save` 用 `tempfile.mkstemp + os.replace` 原子写，多线程 / 多进程并发调用均安全
+- **高阶查询**：原生 filter JSON、简化 `--where` DSL（DateTime 字段误用范围操作符会**提前报错**）、`--sort`、`--fields` 投影、`--fuzzy` 跨字段模糊搜索、`--all` 自动分页（带截断警告 + `items_cap` 软上限）
 - **写操作权限围栏**：CLI 层面强制要求 `--confirm`，未带 flag 时打印 DRY RUN 预览并退出码 2，防止 LLM 擅自写入
 
 ## 触发场景
@@ -55,8 +58,8 @@ feishu-super env                                                  # 环境诊断
 feishu-super tables list  [--app-token T] [--name 关键词]
 feishu-super tables get <table_id>
 feishu-super fields list  <table_id> [--name X] [--type 1]        # 字段探查
-feishu-super records list  <table_id> [--all] [--show 10] [--no-expand]
-feishu-super records get   <table_id> <record_id> [--no-expand]
+feishu-super records list  <table_id> [--all] [--show 10] [--no-expand] [--expand-only F1,F2]
+feishu-super records get   <table_id> <record_id> [--no-expand] [--expand-only F1,F2]
 feishu-super records search <table_id> \                          # 核心查询
     [--filter '<raw_json>']         # 完整 Feishu filter JSON
     [--where 'name contains "abc" and status = active']  # 简化 DSL
@@ -67,6 +70,7 @@ feishu-super records search <table_id> \                          # 核心查询
     [--date-field 日期 --date-on 2026-04-11]
     [--date-field 日期 --date-range 2026-04-01..2026-04-30]
     [--all] [--show 20] [--client-fuzzy] [--no-expand]
+    [--expand-only 上课人,会员卡]  # 只展开列出的 link 字段，跳过其它（0.3 新）
 ```
 
 **Link 字段自动展开**（默认开启）：所有 `records search / list / get` 返回的
@@ -85,7 +89,11 @@ SingleLink/DuplexLink 字段会自动补齐成：
 ```
 
 下游脚本读 `fields["上课人"][0]["linked_records"][0]["fields"]["储值余额（元）"]`
-即可拿到客户储值余额，**不必再调 records get**。加 `--no-expand` 关闭。
+即可拿到客户储值余额，**不必再调 records get**。
+
+**精确控制**：
+- `--no-expand`：完全关闭 Link 展开
+- `--expand-only 上课人`：只展开列出的 link 字段，跳过其它（源表 link 字段多、下游只需要 1~2 个时首选，避免拉无用目标表 + 砍 stdout JSON 30~50%）
 
 ### 增 / 删 / 改（**必须走权限围栏**）
 
