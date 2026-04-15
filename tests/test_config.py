@@ -11,9 +11,13 @@ from feishu_super.config import describe_config, resolve_config
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
+def _clean_env(monkeypatch, tmp_path):
     for key in ("FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_APP_TOKEN"):
         monkeypatch.delenv(key, raising=False)
+    # Isolate SKILL_ROOT/.env so a real .env at the project root doesn't
+    # leak into tests that expect a clean environment.
+    from feishu_super import config as _config
+    monkeypatch.setattr(_config, "SKILL_ROOT", tmp_path)
 
 
 def test_resolve_from_overrides(tmp_path: Path):

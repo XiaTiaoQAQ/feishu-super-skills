@@ -73,3 +73,27 @@ def test_paginate_stops_when_no_page_token_despite_has_more():
         ]
     )
     assert paginate_all(fetch, fetch_all=True) == [1]
+
+
+def test_paginate_items_cap_stops_early_with_warn(capsys):
+    # items_cap acts as a soft ceiling: even if has_more=True, we stop once
+    # accumulated items meet the cap, and a warning is emitted.
+    def fetch(_pt):
+        return {"items": [1, 2, 3, 4, 5], "has_more": True, "page_token": "next"}
+
+    items = paginate_all(fetch, fetch_all=True, items_cap=10)
+    # Two pages × 5 rows = 10 hits the cap exactly, then we stop.
+    assert len(items) == 10
+    err = capsys.readouterr().err
+    assert "items_cap" in err
+
+
+def test_paginate_items_cap_does_not_warn_when_data_exhausted_first():
+    # items_cap is high enough that we hit end-of-data first → no warn.
+    fetch = _fake_pages(
+        [
+            {"items": [1, 2, 3], "has_more": False},
+        ]
+    )
+    items = paginate_all(fetch, fetch_all=True, items_cap=100)
+    assert items == [1, 2, 3]

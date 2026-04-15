@@ -339,6 +339,92 @@ def test_expand_groups_by_target_table():
     assert result[1]["fields"]["服务"][0]["text"] == "力量训练"
 
 
+def test_expand_only_whitelist_skips_other_link_fields():
+    """When `only` is provided, only the named link fields get expanded;
+    other link fields keep their original short shape (untouched)."""
+    source_schema = TableSchema(
+        table_id="tbl_src",
+        by_name={
+            "教练": FieldMeta("fld_coach", "教练", 18, {"table_id": "tbl_coach"}),
+            "服务": FieldMeta("fld_svc", "服务", 18, {"table_id": "tbl_svc"}),
+        },
+        by_id={},
+    )
+    records = [
+        {
+            "record_id": "recA",
+            "fields": {
+                "教练": {"link_record_ids": ["rec_c1"]},
+                "服务": {"link_record_ids": ["rec_s1"]},
+            },
+        }
+    ]
+    coach_list = {
+        "code": 0,
+        "data": {
+            "items": [{"record_id": "rec_c1", "fields": {"教练姓名": "田阳"}}],
+            "has_more": False,
+        },
+    }
+    fields_coach = {
+        "code": 0,
+        "data": {
+            "items": [{"field_id": "fn", "field_name": "教练姓名", "type": 1, "property": {}}],
+            "has_more": False,
+        },
+    }
+    client = StubClient(
+        {
+            "/bitable/v1/apps/app/tables/tbl_coach/records": [coach_list],
+            "/bitable/v1/apps/app/tables/tbl_coach/fields": [fields_coach],
+        }
+    )
+
+    result = expand_links(client, "app", records, source_schema, only={"教练"})
+
+    # 教练 was expanded normally.
+    assert result[0]["fields"]["教练"][0]["text"] == "田阳"
+    assert result[0]["fields"]["教练"][0]["linked_records"][0]["fields"]["教练姓名"] == "田阳"
+    # 服务 was NOT expanded — still in the original short shape.
+    assert result[0]["fields"]["服务"] == {"link_record_ids": ["rec_s1"]}
+    # And no API calls touched tbl_svc at all.
+    svc_calls = [p for p, _ in client.get_calls if "tbl_svc" in p]
+    assert svc_calls == []
+
+
+def test_expand_only_empty_set_is_treated_as_no_op():
+    """`only=set()` — caller wanted to expand nothing — should be a no-op
+    (no API calls, records unchanged)."""
+    source_schema = _coach_schema("app", "tbl_src", "tbl_coach")
+    records = [
+        {
+            "record_id": "recA",
+            "fields": {"教练": {"link_record_ids": ["rec_c1"]}},
+        }
+    ]
+    client = StubClient({})
+    result = expand_links(client, "app", records, source_schema, only=set())
+    assert client.get_calls == []
+    assert result[0]["fields"]["教练"] == {"link_record_ids": ["rec_c1"]}
+
+
+def test_expand_only_unknown_name_silently_skips():
+    """expand_links itself doesn't validate names — that's the CLI layer's
+    job (see test_records_cli). When `only` contains a name that isn't a
+    link field on the schema, expand_links just skips everything."""
+    source_schema = _coach_schema("app", "tbl_src", "tbl_coach")
+    records = [
+        {
+            "record_id": "recA",
+            "fields": {"教练": {"link_record_ids": ["rec_c1"]}},
+        }
+    ]
+    client = StubClient({})
+    result = expand_links(client, "app", records, source_schema, only={"不存在"})
+    assert client.get_calls == []
+    assert result[0]["fields"]["教练"] == {"link_record_ids": ["rec_c1"]}
+
+
 def test_expand_missing_target_record_leaves_empty_text():
     """If a link points at a record_id that's not in the target table
     (deleted, permission, etc.), we should return empty text rather than

@@ -39,6 +39,8 @@ uv run feishu-super <group> <command> [args]
 - `--fuzzy` 默认走服务端 filter（对所有 Text/Phone/Url 字段 OR contains）。只有在字段都是公式/链接等非文本类型时才用 `--client-fuzzy`。
 - 聚合多页时用 `--all`，但**主动加 `--show N`** 控制 JSON 输出大小（默认只展示前 10 条 + 总数）。
 - 不要无脑 `records list --all` 抓整表 —— 飞书表动辄数千记录。
+- **page_size 默认已经是 500**（飞书 API 真上限）。**不要再手动加 `--page-size 100`**，那是上一版本的反模式。
+- **`--all` 默认上限**：500 行/页 × 200 页 = **100k 行**。超过会 stderr warn 并截断。如果实际表更大，必须用 `--filter` / `--where` 收窄。
 
 ## 已知的飞书坑 & 本 Skill 如何帮你避开（**重要**）
 
@@ -70,8 +72,25 @@ uv run feishu-super <group> <command> [args]
 **意味着**：跨表取值时**不需要再发一轮 `records get`**。想要"客户储值余额"、
 "次卡剩余次数"、"教练姓名"、"服务名称"？直接从 `fields["上课人"][0]["linked_records"][0]["fields"]["储值余额（元）"]` 里读即可。
 
-**默认行为**：`records search` / `list` / `get` 全部自动展开 Link 字段。
-如果你不需要 linked_records（例如只想看 record_id），加 `--no-expand`。
+**默认行为**：`records search` / `list` / `get` 全部自动展开**所有** Link 字段。
+expand 内部会**并发**拉取目标表（最多 4 worker，httpx 线程安全 + RLock token 缓存）。
+
+**精确控制（重要新功能）**：
+
+- `--no-expand`：完全不展开（只想看 record_id）
+- `--expand-only 字段A,字段B`：**只**展开列出的 link 字段，跳过其它。**优先用这个**。
+
+为什么 `--expand-only` 重要：源表如果有 6 个 link 字段指向 4 张目标表，默认 expand
+会把这 4 张目标表**全部**全表拉一次。但用户通常只需要 1~2 个 link 字段的关联数据。
+显式 `--expand-only 上课人` 能：
+- 跳过 3~5 张目标表的 records + fields 调用（每张 2~15 秒不等）
+- stdout JSON 体积砍掉 30~50%
+- LLM context 占用线性下降
+
+**`--expand-only` 校验是 fail-fast 的**：字段名不存在 → exit 2；字段类型不是
+SingleLink/DuplexLink → exit 2。直接根据 stderr 错误信息修正字段名。
+
+**与 `--no-expand` 互斥**：同时传两个 → exit 2。
 
 **限制**：只展开 SingleLink (type=18) 和 DuplexLink (type=21)。Lookup
 (type=19) / Formula (type=20) 不展开。展开只做**单层**，不做递归。
@@ -108,9 +127,16 @@ CLI 会：
 表，一次命令可能花几分钟。如果你能用 `--where` 预先缩小范围（比如加一个
 服务端可支持的条件 `状态 = active`），优先这么做，把日期放最后。
 
+### 坑 4：避免重复扫表
+
+如果业务需要"窗口 A（90 天）和窗口 B（30 天）的差集 / 比例 / 计数对比"，
+**永远只扫一次（取较大的窗口），本地用 Python 做双过滤**。绝不要跑两次 search。
+30 天数据是 90 天的子集，重扫一次浪费同等的网络时间和 API 配额。
+
 ## 典型跨表报表任务的推荐写法
 
-例如"次日预约提醒"：
+### 模式 A：次日预约提醒（需要全部 link 字段）
+
 ```bash
 uv run feishu-super records search <销课表> \
   --date-field 日期 --date-tomorrow --tz Asia/Shanghai \
@@ -119,6 +145,36 @@ uv run feishu-super records search <销课表> \
 返回的 JSON 里，每条记录的 `教练`、`预约服务`、`上课人`、`次卡课包` 全部
 自动展开成 `linked_records`，下游 Python / jq 脚本直接读目标字段即可，
 **零额外 API 调用**。
+
+### 模式 B：低频客户报表（只需要客户余额这一项 link 数据）
+
+**首选写法**——只扫一次表，本地双窗口过滤，只展开必要的 link 字段：
+
+```bash
+uv run feishu-super records search <销课表> \
+  --date-field 日期 --date-range $(date -d '90 days ago' +%F)..$(date +%F) \
+  --expand-only 上课人 \
+  --show 0 > sales_90d.json
+
+# 然后本地脚本：
+# - 90 天 / 30 天双窗口都从 sales_90d.json 过滤，不再调一次 API
+# - 客户余额从 fields["上课人"][0]["linked_records"][0]["fields"]["储值余额（元）"] 直接读
+```
+
+**反模式**（不要这么写）：
+- ❌ 跑两次 search（90 天一次 + 30 天一次）—— 30 天数据是 90 天的子集，纯浪费
+- ❌ 不传 `--expand-only` —— 拉出整张教练/服务/课包表却用不到，每次浪费 ~5s + 几百 KB
+- ❌ 手动加 `--page-size 100` —— 那是上一版本的反模式，CLI 默认已经是 500
+
+### 模式 C：纯统计型查询（只要 count，不要明细）
+
+只关心总数，**不要展开 link**：
+```bash
+uv run feishu-super records search <表> \
+  --where '状态 = active' --no-expand --show 0
+```
+`--show 0` 让 stdout 只输出 `{"total": N, "showing": 0, "records": []}`，
+零 link 拉取 + 几十字节响应，最快。
 
 ## 错误处理
 

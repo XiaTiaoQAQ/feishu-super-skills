@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,11 +50,28 @@ def save(app_id: str, token: str, expires_in: int) -> TokenEntry:
     entry = TokenEntry(token=token, expires_at=time.time() + float(expires_in))
     payload = {"token": entry.token, "expires_at": entry.expires_at}
     p = _cache_path(app_id)
-    p.write_text(json.dumps(payload), encoding="utf-8")
+    # Atomic write: tempfile.mkstemp guarantees a unique path even across
+    # threads of the same process, then os.replace renames atomically. This
+    # protects against (a) parallel CLI invocations racing on the same file
+    # and (b) multiple threads in one process racing on the same write.
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f"{p.name}.tmp.", dir=str(p.parent)
+    )
     try:
-        p.chmod(0o600)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(payload))
+        try:
+            os.chmod(tmp_name, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_name, p)
+    except BaseException:
+        # Best-effort cleanup if anything before os.replace blew up.
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     return entry
 
 

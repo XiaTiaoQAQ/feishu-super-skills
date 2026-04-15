@@ -9,8 +9,9 @@
 
 from __future__ import annotations
 
+import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -18,7 +19,12 @@ import httpx
 from feishu_super import token_cache
 
 BASE_URL = "https://open.feishu.cn/open-apis"
-DEFAULT_TIMEOUT = 30.0
+# 60s leaves headroom for page_size=500 responses (can reach several MB on
+# wide tables). POST endpoints (records/search) deliberately do NOT retry on
+# transport errors (see request() — POST retry risks double-applying writes),
+# so a single timeout is fatal for the entire query. Conservative timeout
+# avoids spurious failures under variable network conditions.
+DEFAULT_TIMEOUT = 60.0
 
 RATE_LIMIT_CODES: frozenset[int] = frozenset({99991400, 1254607})
 TOKEN_INVALID_CODES: frozenset[int] = frozenset({99991663, 99991668})
@@ -42,6 +48,11 @@ class LarkClient:
     timeout: float = DEFAULT_TIMEOUT
     _http: httpx.Client | None = None
     _token: str | None = None
+    # RLock (not Lock) because _invalidate_token is invoked from request()
+    # while it already holds the lock via _get_token; an Lock would deadlock.
+    # httpx.Client is already thread-safe, so the lock only protects the
+    # token state itself, not the HTTP layer.
+    _token_lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def __post_init__(self) -> None:
         self._http = httpx.Client(base_url=self.base_url, timeout=self.timeout)
@@ -70,18 +81,24 @@ class LarkClient:
         return token
 
     def _get_token(self, *, force_refresh: bool = False) -> str:
+        # The double-checked-locking pattern keeps the fast path lock-free for
+        # the >99% case where _token is already set and fresh.
         if not force_refresh and self._token:
             return self._token
-        if not force_refresh:
-            cached = token_cache.load(self.app_id)
-            if cached and cached.is_fresh():
-                self._token = cached.token
-                return cached.token
-        return self._fetch_token()
+        with self._token_lock:
+            if not force_refresh and self._token:
+                return self._token
+            if not force_refresh:
+                cached = token_cache.load(self.app_id)
+                if cached and cached.is_fresh():
+                    self._token = cached.token
+                    return cached.token
+            return self._fetch_token()
 
     def _invalidate_token(self) -> None:
-        token_cache.purge(self.app_id)
-        self._token = None
+        with self._token_lock:
+            token_cache.purge(self.app_id)
+            self._token = None
 
     # -------- request --------
 

@@ -1,6 +1,6 @@
 [project]
 name = "feishu-super"
-version = "0.2.0"
+version = "0.3.0"
 description = "Feishu Bitable OpenAPI skill for LLM agents — CRUD with permission guard, Link auto-expansion, date-semantic filtering, and rich query DSL"
 requires-python = ">=3.11"
 dependencies = [

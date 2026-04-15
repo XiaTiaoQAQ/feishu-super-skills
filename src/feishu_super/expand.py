@@ -45,6 +45,7 @@ form cycles.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from feishu_super.client import LarkClient
@@ -52,6 +53,13 @@ from feishu_super.commands._common import paginate_all
 from feishu_super.schema import TableSchema, get_table_schema
 
 LINK_FIELD_TYPES: frozenset[int] = frozenset({18, 21})
+
+# Cap concurrent target-table fetches. Empirically Feishu has no read rate
+# limit at this level (8 concurrent search workers all returned 0 errors),
+# but 4 is enough to saturate the wall-time bottleneck in any realistic
+# expand scenario (1-6 distinct target tables) and leaves QPS budget for
+# other concurrent operations the caller may do.
+EXPAND_MAX_WORKERS = 4
 
 
 def _needs_expand(value: Any) -> bool:
@@ -184,6 +192,8 @@ def expand_links(
     app_token: str,
     records: list[dict[str, Any]],
     schema: TableSchema,
+    *,
+    only: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Normalize and enrich Link fields in-place.
 
@@ -192,19 +202,31 @@ def expand_links(
     being the full `{record_id, fields}` dict of each target row. Callers
     can reach arbitrary target-table columns without another API call.
 
+    `only`: optional set of field names to restrict expansion to. When
+    None, every SingleLink/DuplexLink field on the source table is expanded
+    (the historical default). When set, only those listed link fields are
+    enriched — other link fields are left in their original Feishu shape.
+    The caller is responsible for validating that the names are real link
+    fields; this function silently skips unknowns.
+
     Returns the same list (mutation is in-place for efficiency).
     """
     if not records:
         return records
 
     # Step 1: figure out which fields in the source table are Link-typed and
-    # which target tables they point to.
+    # which target tables they point to. When `only` is provided we further
+    # restrict to that whitelist — no point pulling target tables for fields
+    # the caller said they don't need.
     link_fields: dict[str, str] = {}  # field_name → target_table_id
     for name, meta in schema.by_name.items():
-        if meta.type in LINK_FIELD_TYPES:
-            tid = meta.target_table_id
-            if tid:
-                link_fields[name] = tid
+        if meta.type not in LINK_FIELD_TYPES:
+            continue
+        if only is not None and name not in only:
+            continue
+        tid = meta.target_table_id
+        if tid:
+            link_fields[name] = tid
 
     if not link_fields:
         return records
@@ -228,12 +250,39 @@ def expand_links(
 
     # Step 3: for each target table, fetch once and build an index of
     # full records keyed by record_id, plus remember the primary field.
+    #
+    # Multiple target tables are fetched concurrently — each table's pull is
+    # ~13s for a few thousand rows and the API has no rate limit at this
+    # level. The same LarkClient is shared across worker threads (httpx is
+    # thread-safe; token refresh is RLock-protected). Hard-fail semantics:
+    # if any worker raises (FeishuApiError, network, etc.), the executor
+    # context cancels remaining futures and the exception propagates up.
     target_indexes: dict[str, dict[str, dict[str, Any]]] = {}
     target_primary: dict[str, str | None] = {}
-    for tid in needed:
+    needed_ids = list(needed)
+    if len(needed_ids) == 1:
+        tid = needed_ids[0]
         index, primary = _build_target_index(client, app_token, tid)
         target_indexes[tid] = index
         target_primary[tid] = primary
+    else:
+        workers = min(len(needed_ids), EXPAND_MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = {
+                ex.submit(_build_target_index, client, app_token, tid): tid
+                for tid in needed_ids
+            }
+            try:
+                for fut, tid in futures.items():
+                    index, primary = fut.result()
+                    target_indexes[tid] = index
+                    target_primary[tid] = primary
+            except BaseException:
+                # Cancel any pending futures so we don't waste 10+ seconds
+                # finishing work whose results we'll discard.
+                for fut in futures:
+                    fut.cancel()
+                raise
 
     # Step 4: rewrite each link field to include linked_records.
     for rec in records:

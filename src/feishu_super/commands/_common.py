@@ -14,7 +14,12 @@ from feishu_super.formatters import emit_error, emit_warn
 # hold millions of records — without a cap a runaway command could hang the CLI
 # and blow memory. When this cap is hit we warn the user explicitly so they
 # know results were truncated, rather than silently returning partial data.
-MAX_PAGES = 50
+#
+# 200 pages × 500 rows/page = 100k row default ceiling. The previous value (50)
+# combined with the previous default page_size (100) capped --all at 5000 rows,
+# which silently truncated commonplace tables (e.g. 9158-row 销课记录 lost
+# 4158 rows without warning when fetched via plain list --all).
+MAX_PAGES = 200
 
 
 def build_client(ctx: typer.Context) -> LarkClient:
@@ -62,27 +67,42 @@ def paginate_all(
     *,
     max_pages: int = MAX_PAGES,
     resource_label: str = "records",
+    items_cap: int | None = None,
 ) -> list[dict[str, Any]]:
     """Shared pagination driver for any Feishu list/search endpoint.
 
     `fetch_page(page_token)` must return the endpoint's `data` dict, i.e. a
     mapping containing `items`, `has_more`, `page_token`. A None/empty response
     is treated as end-of-stream.
+
+    `items_cap` (optional): soft ceiling on accumulated items. When the
+    accumulator reaches this number, pagination stops early with a warning.
+    Useful as a second layer of defense against runaway client_fuzzy-style
+    flows that would load 100k records into memory and then scan them.
     """
     items: list[dict[str, Any]] = []
     page_token: str | None = None
     pages = max_pages if fetch_all else 1
     has_more = False
+    cap_hit = False
     for _ in range(pages):
         data = fetch_page(page_token) or {}
         items.extend(data.get("items") or [])
         has_more = bool(data.get("has_more"))
+        if items_cap is not None and len(items) >= items_cap:
+            cap_hit = True
+            break
         if not fetch_all or not has_more:
             return items
         page_token = data.get("page_token")
         if not page_token:
             return items
-    if has_more:
+    if cap_hit:
+        emit_warn(
+            f"[!] --all 达到 items_cap={items_cap}（实际 {len(items)} 条 {resource_label}），"
+            f"已停止分页。请用 --filter/--where 收窄查询范围。"
+        )
+    elif has_more:
         emit_warn(
             f"[!] --all 达到 {max_pages} 页上限（约 {len(items)} 条 {resource_label}），"
             f"结果已截断。建议加 --filter/--where 缩小范围，或手动迭代 --page-size/--page-token。"

@@ -54,16 +54,20 @@ class TableSchema:
         return meta.type if meta else None
 
 
-# key: (id(client), app_token, table_id) — include client identity so tests
-# that swap the client don't get cross-contamination.
-_schema_cache: dict[tuple[int, str, str], TableSchema] = {}
+# key: (app_token, table_id). Schema is a property of the table, not of the
+# client instance — caching by (app_token, table_id) lets the same CLI command
+# share results across multiple LarkClient instances (records.py historically
+# built one client for the schema probe and a second for the main request,
+# which silently double-fetched fields). Tests that need isolation must call
+# clear_cache() in fixtures.
+_schema_cache: dict[tuple[str, str], TableSchema] = {}
 
 
 def get_table_schema(
     client: LarkClient, app_token: str, table_id: str
 ) -> TableSchema:
     """Fetch (and cache) the schema of a Bitable table."""
-    key = (id(client), app_token, table_id)
+    key = (app_token, table_id)
     cached = _schema_cache.get(key)
     if cached is not None:
         return cached
