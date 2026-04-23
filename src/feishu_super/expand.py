@@ -49,7 +49,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from feishu_super.client import LarkClient
-from feishu_super.commands._common import paginate_all
+from feishu_super.commands._common import chunked_post, paginate_all
 from feishu_super.schema import TableSchema, get_table_schema
 
 LINK_FIELD_TYPES: frozenset[int] = frozenset({18, 21})
@@ -60,6 +60,16 @@ LINK_FIELD_TYPES: frozenset[int] = frozenset({18, 21})
 # expand scenario (1-6 distinct target tables) and leaves QPS budget for
 # other concurrent operations the caller may do.
 EXPAND_MAX_WORKERS = 4
+
+# Feishu's records/batch_get accepts at most 100 record_ids per request.
+BATCH_GET_CHUNK = 100
+
+# Below this many referenced ids we fire one-or-a-few batch_get calls instead
+# of scanning the full target table. Measured crossover: on a 5947-row target
+# with 17 refs, batch_get = 0.9s vs list --all = 75s (86× speedup). With
+# 1000 refs the two strategies are roughly tied (10 batch_get chunks ≈ 12
+# list pages); beyond that, list --all wins on round-trip count.
+SPARSE_BATCH_GET_THRESHOLD = 1000
 
 
 def _needs_expand(value: Any) -> bool:
@@ -142,10 +152,69 @@ def _extract_text(raw_fields: dict[str, Any], primary: str | None) -> str:
     return str(val)
 
 
+def _should_use_sparse_path(ref_ids: set[str] | None) -> bool:
+    """Policy: dispatch to batch_get only when we have a non-empty, small-enough id set.
+
+    `None` means the caller didn't track refs — fall back to dense list.
+    Empty set would mean "no refs to resolve," but the upstream step skips
+    such targets entirely, so this branch is defensive.
+    """
+    return ref_ids is not None and 0 < len(ref_ids) <= SPARSE_BATCH_GET_THRESHOLD
+
+
+def _batch_get_target_records(
+    client: LarkClient,
+    app_token: str,
+    target_table_id: str,
+    ids: list[str],
+) -> list[dict[str, Any]]:
+    """Fetch specific target records by id via POST .../records/batch_get.
+
+    Returns the raw list of {record_id, fields} dicts. Respects the
+    100-ids-per-request API cap.
+
+    Multi-chunk calls run concurrently — a 500-ref fetch (5 chunks × ~0.9s
+    serial) becomes ~1s wall time. Single-chunk calls skip the executor
+    entirely to avoid its setup overhead.
+    """
+    path = f"/bitable/v1/apps/{app_token}/tables/{target_table_id}/records/batch_get"
+    if len(ids) <= BATCH_GET_CHUNK:
+        return chunked_post(
+            client,
+            path,
+            ids,
+            body_key="record_ids",
+            response_key="records",
+            chunk_size=BATCH_GET_CHUNK,
+        )
+
+    chunks: list[list[str]] = [
+        ids[i : i + BATCH_GET_CHUNK] for i in range(0, len(ids), BATCH_GET_CHUNK)
+    ]
+    workers = min(len(chunks), EXPAND_MAX_WORKERS)
+
+    def fetch(chunk: list[str]) -> list[dict[str, Any]]:
+        return chunked_post(
+            client,
+            path,
+            chunk,
+            body_key="record_ids",
+            response_key="records",
+            chunk_size=BATCH_GET_CHUNK,
+        )
+
+    out: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for recs in ex.map(fetch, chunks):
+            out.extend(recs)
+    return out
+
+
 def _build_target_index(
     client: LarkClient,
     app_token: str,
     target_table_id: str,
+    ref_ids: set[str] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], str | None]:
     """Return (record_id → target_record_dict) + the primary field name.
 
@@ -154,26 +223,41 @@ def _build_target_index(
     reach arbitrary downstream columns (储值余额, 剩余次数, ...) without
     an extra API roundtrip.
 
-    Uses `records/list --all` because list natively returns the complete
-    shape. Capped by paginate_all's MAX_PAGES with a warning.
+    Two strategies:
+      - SPARSE (ref_ids supplied and 0 < |ref_ids| ≤ SPARSE_BATCH_GET_THRESHOLD):
+        call batch_get for those specific ids. Massive win when a narrow source
+        query (e.g. yesterday's 18 records) references a tiny fraction of a
+        large target table (e.g. 17 customers out of 5947).
+      - DENSE (no ref_ids, or too many): fall back to records/list --all.
+        Fewer round trips when a large share of the target table is needed.
+
+    `ref_ids=None` or `ref_ids=set()` both route to the dense path — the
+    former means "caller didn't track refs," the latter means "nothing
+    referenced" (upstream usually skips such targets, but we tolerate it).
     """
     target_schema = get_table_schema(client, app_token, target_table_id)
     primary = _primary_field_name(target_schema)
 
-    path = f"/bitable/v1/apps/{app_token}/tables/{target_table_id}/records"
+    if _should_use_sparse_path(ref_ids):
+        assert ref_ids is not None  # narrowed by _should_use_sparse_path
+        items = _batch_get_target_records(
+            client, app_token, target_table_id, list(ref_ids)
+        )
+    else:
+        path = f"/bitable/v1/apps/{app_token}/tables/{target_table_id}/records"
 
-    def fetch(pt: str | None) -> dict[str, Any]:
-        params: dict[str, Any] = {"page_size": 500}
-        if pt:
-            params["page_token"] = pt
-        return client.get(path, params=params).get("data") or {}
+        def fetch(pt: str | None) -> dict[str, Any]:
+            params: dict[str, Any] = {"page_size": 500}
+            if pt:
+                params["page_token"] = pt
+            return client.get(path, params=params).get("data") or {}
 
-    items = paginate_all(
-        fetch,
-        fetch_all=True,
-        max_pages=200,  # 500 × 200 = 100k-row ceiling per target table
-        resource_label=f"records in {target_table_id}",
-    )
+        items = paginate_all(
+            fetch,
+            fetch_all=True,
+            max_pages=200,  # 500 × 200 = 100k-row ceiling per target table
+            resource_label=f"records in {target_table_id}",
+        )
 
     index: dict[str, dict[str, Any]] = {}
     for rec in items:
@@ -262,14 +346,18 @@ def expand_links(
     needed_ids = list(needed)
     if len(needed_ids) == 1:
         tid = needed_ids[0]
-        index, primary = _build_target_index(client, app_token, tid)
+        index, primary = _build_target_index(
+            client, app_token, tid, ref_ids=needed[tid]
+        )
         target_indexes[tid] = index
         target_primary[tid] = primary
     else:
         workers = min(len(needed_ids), EXPAND_MAX_WORKERS)
         with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = {
-                ex.submit(_build_target_index, client, app_token, tid): tid
+                ex.submit(
+                    _build_target_index, client, app_token, tid, needed[tid]
+                ): tid
                 for tid in needed_ids
             }
             try:

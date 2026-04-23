@@ -61,7 +61,11 @@ def _make_records():
 
 
 class ThreadingStubClient:
-    """Tracks concurrent access patterns for assertions about parallelism."""
+    """Tracks concurrent access patterns for assertions about parallelism.
+
+    Handles both GET (schema + list --all) and POST (batch_get). Defaults
+    match the endpoint's natural shape so callers don't need to differentiate.
+    """
 
     def __init__(self, table_responses: dict[str, list[dict[str, Any]]],
                  *, fetch_delay: float = 0.0,
@@ -72,42 +76,63 @@ class ThreadingStubClient:
         self._lock = threading.Lock()
         self._fetch_delay = fetch_delay
         self._fail_paths = fail_paths or set()
-        # in-flight: at any moment, how many threads are currently inside .get()
+        # in-flight: at any moment, how many threads are currently inside a call
         self._inflight = 0
         self.max_inflight = 0
 
-    def get(self, path: str, params: dict | None = None) -> dict:
+    def _serve(self, path: str) -> dict:
+        if path in self._fail_paths:
+            raise FeishuApiError(1254030, "synthetic error", url=path)
+        if self._fetch_delay:
+            time.sleep(self._fetch_delay)
+        if path in self._responses and self._responses[path]:
+            return self._responses[path].pop(0)
+        if path.endswith("/batch_get"):
+            return {"code": 0, "data": {"records": []}}
+        return {"code": 0, "data": {"items": [], "has_more": False}}
+
+    def _enter(self, path: str, params_or_body: Any) -> None:
         with self._lock:
             self._inflight += 1
             self.max_inflight = max(self.max_inflight, self._inflight)
-            self.calls.append((path, dict(params or {}), time.perf_counter()))
+            self.calls.append((path, params_or_body, time.perf_counter()))
+
+    def _exit(self) -> None:
+        with self._lock:
+            self._inflight -= 1
+
+    def get(self, path: str, params: dict | None = None) -> dict:
+        self._enter(path, dict(params or {}))
         try:
-            if path in self._fail_paths:
-                raise FeishuApiError(1254030, "synthetic error", url=path)
-            if self._fetch_delay:
-                time.sleep(self._fetch_delay)
-            if path in self._responses and self._responses[path]:
-                return self._responses[path].pop(0)
-            return {"code": 0, "data": {"items": [], "has_more": False}}
+            return self._serve(path)
         finally:
-            with self._lock:
-                self._inflight -= 1
+            self._exit()
+
+    def post(self, path: str, json_body: Any = None, params: dict | None = None) -> dict:
+        self._enter(path, json_body)
+        try:
+            return self._serve(path)
+        finally:
+            self._exit()
 
 
 def _canned_target_responses():
-    """Build canned records/list and fields/list responses for all 4 targets."""
+    """Build canned records/batch_get and fields/list responses for all 4 targets.
+
+    Single-ref-per-field tests → sparse expand path → batch_get endpoint.
+    """
     return {
-        "/bitable/v1/apps/app/tables/tbl_customer/records": [
-            {"code": 0, "data": {"items": [{"record_id": "rec_cust1", "fields": {"客户名称": "申晴", "余额": 8570}}], "has_more": False}}
+        "/bitable/v1/apps/app/tables/tbl_customer/records/batch_get": [
+            {"code": 0, "data": {"records": [{"record_id": "rec_cust1", "fields": {"客户名称": "申晴", "余额": 8570}}]}}
         ],
-        "/bitable/v1/apps/app/tables/tbl_coach/records": [
-            {"code": 0, "data": {"items": [{"record_id": "rec_coach1", "fields": {"教练姓名": "田阳"}}], "has_more": False}}
+        "/bitable/v1/apps/app/tables/tbl_coach/records/batch_get": [
+            {"code": 0, "data": {"records": [{"record_id": "rec_coach1", "fields": {"教练姓名": "田阳"}}]}}
         ],
-        "/bitable/v1/apps/app/tables/tbl_pkg/records": [
-            {"code": 0, "data": {"items": [{"record_id": "rec_pkg1", "fields": {"课包名": "次卡A"}}], "has_more": False}}
+        "/bitable/v1/apps/app/tables/tbl_pkg/records/batch_get": [
+            {"code": 0, "data": {"records": [{"record_id": "rec_pkg1", "fields": {"课包名": "次卡A"}}]}}
         ],
-        "/bitable/v1/apps/app/tables/tbl_svc/records": [
-            {"code": 0, "data": {"items": [{"record_id": "rec_svc1", "fields": {"服务名": "力量训练"}}], "has_more": False}}
+        "/bitable/v1/apps/app/tables/tbl_svc/records/batch_get": [
+            {"code": 0, "data": {"records": [{"record_id": "rec_svc1", "fields": {"服务名": "力量训练"}}]}}
         ],
         # Field schemas — primary field of each target, plus matching extras.
         "/bitable/v1/apps/app/tables/tbl_customer/fields": [
@@ -180,7 +205,7 @@ def test_expand_concurrent_propagates_first_error():
     responses = _canned_target_responses()
     client = ThreadingStubClient(
         responses,
-        fail_paths={"/bitable/v1/apps/app/tables/tbl_coach/records"},
+        fail_paths={"/bitable/v1/apps/app/tables/tbl_coach/records/batch_get"},
     )
 
     with pytest.raises(FeishuApiError) as exc_info:
@@ -205,3 +230,67 @@ def test_expand_single_target_takes_inline_path():
     assert result[0]["fields"]["教练"][0]["text"] == "田阳"
     # Single target means no concurrency, so max_inflight stays at 1.
     assert client.max_inflight == 1
+
+
+def test_sparse_path_parallelizes_chunks():
+    """When one target's ref set spans multiple batch_get chunks, those chunks
+    must fire concurrently — otherwise a 500-ref expand (5 chunks × ~0.9s)
+    would tail-block the whole operation at ~4.5s."""
+    from feishu_super.expand import BATCH_GET_CHUNK
+
+    schema = TableSchema(
+        table_id="tbl_src",
+        by_name={
+            "教练": FieldMeta("fld_b", "教练", 18, {"table_id": "tbl_coach"}),
+        },
+        by_id={},
+    )
+    # 3 full chunks worth of distinct refs (cap per chunk = BATCH_GET_CHUNK).
+    n_chunks = 3
+    total = n_chunks * BATCH_GET_CHUNK
+    records = [
+        {"record_id": f"recA{i}", "fields": {"教练": {"link_record_ids": [f"rec_c{i}"]}}}
+        for i in range(total)
+    ]
+    # Each batch_get response covers its own chunk.
+    batch_responses = [
+        {
+            "code": 0,
+            "data": {
+                "records": [
+                    {"record_id": f"rec_c{j}", "fields": {"教练姓名": f"n{j}"}}
+                    for j in range(c * BATCH_GET_CHUNK, (c + 1) * BATCH_GET_CHUNK)
+                ],
+            },
+        }
+        for c in range(n_chunks)
+    ]
+    fields_coach = {
+        "code": 0,
+        "data": {
+            "items": [{"field_id": "fn", "field_name": "教练姓名", "type": 1, "property": {}}],
+            "has_more": False,
+        },
+    }
+    # 0.1s per POST — serial would be 0.3s+, concurrent should be ~0.1s.
+    client = ThreadingStubClient(
+        {
+            "/bitable/v1/apps/app/tables/tbl_coach/records/batch_get": batch_responses,
+            "/bitable/v1/apps/app/tables/tbl_coach/fields": [fields_coach],
+        },
+        fetch_delay=0.10,
+    )
+
+    t0 = time.perf_counter()
+    result = expand_links(client, "app", records, schema)
+    dt = time.perf_counter() - t0
+
+    # Two qualitative checks: wall time far below serial floor, AND at least
+    # two chunks inflight simultaneously at some point.
+    assert dt < 0.25, f"chunks should run in parallel, took {dt:.2f}s"
+    assert client.max_inflight >= 2, (
+        f"expected parallel chunk dispatch, max_inflight={client.max_inflight}"
+    )
+    # Sanity: all 300 refs resolved.
+    resolved = {r["fields"]["教练"][0]["text"] for r in result}
+    assert resolved == {f"n{i}" for i in range(total)}

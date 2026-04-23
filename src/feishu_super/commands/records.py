@@ -10,6 +10,7 @@ import typer
 from feishu_super.client import LarkClient
 from feishu_super.commands._common import (
     build_client,
+    chunked_post,
     handle_api_error,
     load_json_arg,
     paginate_all,
@@ -488,15 +489,15 @@ def batch_create(
         details={"count": len(records), "chunks": (len(records) + MAX_BATCH - 1) // MAX_BATCH},
         confirm=confirm,
     )
-    created: list[dict[str, Any]] = []
     with build_client(ctx) as client:
-        for i in range(0, len(records), MAX_BATCH):
-            chunk = records[i : i + MAX_BATCH]
-            resp = client.post(
-                f"{_records_base(token, table_id)}/batch_create",
-                json_body={"records": chunk},
-            )
-            created.extend((resp.get("data") or {}).get("records") or [])
+        created = chunked_post(
+            client,
+            f"{_records_base(token, table_id)}/batch_create",
+            records,
+            body_key="records",
+            response_key="records",
+            chunk_size=MAX_BATCH,
+        )
     emit_json({"created": len(created), "records": created})
 
 
@@ -523,15 +524,15 @@ def batch_update(
         details={"count": len(records)},
         confirm=confirm,
     )
-    updated: list[dict[str, Any]] = []
     with build_client(ctx) as client:
-        for i in range(0, len(records), MAX_BATCH):
-            chunk = records[i : i + MAX_BATCH]
-            resp = client.post(
-                f"{_records_base(token, table_id)}/batch_update",
-                json_body={"records": chunk},
-            )
-            updated.extend((resp.get("data") or {}).get("records") or [])
+        updated = chunked_post(
+            client,
+            f"{_records_base(token, table_id)}/batch_update",
+            records,
+            body_key="records",
+            response_key="records",
+            chunk_size=MAX_BATCH,
+        )
     emit_json({"updated": len(updated), "records": updated})
 
 
@@ -553,13 +554,13 @@ def batch_delete(
         details={"count": len(id_list), "irreversible": True},
         confirm=confirm,
     )
-    deleted: list[dict[str, Any]] = []
     with build_client(ctx) as client:
-        for i in range(0, len(id_list), MAX_BATCH):
-            chunk = id_list[i : i + MAX_BATCH]
-            resp = client.post(
-                f"{_records_base(token, table_id)}/batch_delete",
-                json_body={"records": chunk},
-            )
-            deleted.extend((resp.get("data") or {}).get("records") or [])
+        deleted = chunked_post(
+            client,
+            f"{_records_base(token, table_id)}/batch_delete",
+            id_list,
+            body_key="records",
+            response_key="records",
+            chunk_size=MAX_BATCH,
+        )
     emit_json({"deleted": len(deleted), "records": deleted})

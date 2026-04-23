@@ -110,6 +110,36 @@ def paginate_all(
     return items
 
 
+def chunked_post(
+    client: LarkClient,
+    path: str,
+    items: list[Any],
+    *,
+    body_key: str,
+    response_key: str,
+    chunk_size: int,
+) -> list[dict[str, Any]]:
+    """POST `items` in chunks of `chunk_size`, collect response[data][response_key].
+
+    Feishu bulk endpoints (records/batch_create, batch_update, batch_delete,
+    records/batch_get) all share the same wire shape: a POST body with one
+    array field, a response carrying a parallel array field. They also share
+    the same per-request array cap (500 for batch_{create,update,delete},
+    100 for batch_get). This helper captures the common loop so callers only
+    vary `body_key` / `response_key` / `chunk_size`.
+
+    Concurrency is deliberately NOT handled here — callers that want parallel
+    chunks (e.g. expand's batch_get path) wrap this at the call site so each
+    API's concurrency policy stays near its API-specific constants.
+    """
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(items), chunk_size):
+        chunk = items[i : i + chunk_size]
+        resp = client.post(path, json_body={body_key: chunk})
+        out.extend(((resp.get("data") or {}).get(response_key)) or [])
+    return out
+
+
 def load_json_arg(raw: str | None, file_path: str | None) -> Any:
     """Load JSON either from --data '...' or --file path."""
     import json
