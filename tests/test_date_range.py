@@ -128,3 +128,45 @@ def test_filter_records_skips_non_numeric():
         {"record_id": "r2", "fields": {"date": None}},
     ]
     assert filter_records_by_date(recs, "date", r) == []
+
+
+def test_to_feishu_filter_single_day():
+    """Server-side filter for one day: two conditions, ExactDate-tagged,
+    value is str(start_ms) and str(end_ms) exactly (no -1 shift).
+
+    Rationale: Feishu's isGreater/isLess on DateTime compare at day
+    granularity (empirically isGreater := >=day, isLess := <day in
+    tenant timezone), so SH midnight bounds from _day_bounds already
+    describe the intended half-open [start, end) interval without
+    any offset.
+    """
+    r = build_date_range(on="2026-04-22", tz_name="Asia/Shanghai")
+    assert r is not None
+
+    flt = r.to_feishu_filter("日期")
+    assert flt["conjunction"] == "and"
+    assert len(flt["conditions"]) == 2
+
+    by_op = {c["operator"]: c for c in flt["conditions"]}
+    assert set(by_op) == {"isGreater", "isLess"}
+
+    gt = by_op["isGreater"]
+    lt = by_op["isLess"]
+    assert gt["field_name"] == "日期"
+    assert lt["field_name"] == "日期"
+    assert gt["value"] == ["ExactDate", str(r.start_ms)]
+    assert lt["value"] == ["ExactDate", str(r.end_ms)]
+
+
+def test_to_feishu_filter_range_matches_day_bounds():
+    """Multi-day range: boundaries are exactly the DateRange's SH-midnight
+    start and end, so downstream callers can merge this filter into a
+    larger AND without recomputing offsets."""
+    r = build_date_range(
+        range_spec="2026-04-01..2026-04-30", tz_name="Asia/Shanghai"
+    )
+    assert r is not None
+    flt = r.to_feishu_filter("日期")
+    vals = {c["operator"]: c["value"][1] for c in flt["conditions"]}
+    assert vals["isGreater"] == str(_ms(2026, 4, 1))
+    assert vals["isLess"] == str(_ms(2026, 5, 1))  # end of 04-30 = start of 05-01

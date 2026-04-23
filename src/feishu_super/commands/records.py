@@ -114,6 +114,29 @@ def _maybe_expand(
     return expand_links(client, app_token, records, schema, only=only)
 
 
+def _merge_date_range_into_filter(
+    filter_obj: dict[str, Any] | None,
+    date_range: Any,  # DateRange; avoid import cycle concerns
+    date_field: str,
+) -> tuple[dict[str, Any], bool]:
+    """Combine a DateRange with an existing user filter into a single-level filter.
+
+    Returns (merged_filter, server_side_ok). server_side_ok=False means the
+    caller must keep the user filter as-is on the server AND fall back to
+    client-side filter_records_by_date, because Feishu filters are single-
+    level — an OR conjunction at the top can't absorb two extra AND
+    conditions without nesting, which Feishu rejects.
+    """
+    date_filter = date_range.to_feishu_filter(date_field)
+    if filter_obj is None:
+        return date_filter, True
+    if filter_obj.get("conjunction") == "and" and "conditions" in filter_obj:
+        merged = dict(filter_obj)
+        merged["conditions"] = list(filter_obj["conditions"]) + date_filter["conditions"]
+        return merged, True
+    return filter_obj, False
+
+
 # -------- read commands --------
 
 @app.command("list")
@@ -282,45 +305,61 @@ def search_records(
     if fields_spec:
         body["field_names"] = [s.strip() for s in fields_spec.split(",") if s.strip()]
 
-    # Date range is a post-filter: search runs normally, then we drop records
-    # whose date_field falls outside the range. This requires exhaustive
-    # pagination — otherwise the first 100 search hits might all fall outside
-    # the range and we'd return nothing. Auto-force fetch_all.
-    if date_range and not fetch_all:
+    # Date range strategy:
+    #   - Merge into body["filter"] as isGreater/isLess conditions when the
+    #     user filter is absent or top-level AND → server-side path, no full
+    #     table scan. Empirically verified: Feishu interprets those operators
+    #     on DateTime fields at day granularity in SH timezone (isGreater :=
+    #     >=, isLess := <), which matches our half-open [start, end) when the
+    #     bounds are SH midnight (which _day_bounds already produces).
+    #   - Fall back to client-side filter_records_by_date when the user
+    #     filter's top-level conjunction is OR or nested (Feishu filters
+    #     don't nest beyond the single-level shape).
+    server_side_date = False
+    if date_range and date_field:
+        body_filter, server_side_date = _merge_date_range_into_filter(
+            filter_obj, date_range, date_field
+        )
+        body["filter"] = body_filter
+        if not server_side_date:
+            emit_warn(
+                f"[i] 用户 filter 含 OR/嵌套，日期筛选 ({date_range.label}) 回退客户端过滤"
+            )
+
+    # Client-side fallback still needs exhaustive pagination (post-filter).
+    if date_range and not server_side_date and not fetch_all:
         emit_warn(
-            f"[i] 日期筛选 ({date_range.label}) 需要遍历全部记录；已自动开启 --all"
+            f"[i] 日期客户端筛选 ({date_range.label}) 需要遍历全部记录；已自动开启 --all"
         )
         fetch_all = True
     # Date-filter scans can legitimately need to walk tens of thousands of
-    # rows. The default paginate_all cap (50 pages × 100 rows = 5 000) is too
-    # low for that case, so raise it when the user is intentionally asking
-    # for exhaustive date scanning.
-    paginate_max_pages = 1000 if date_range else None
+    # rows. The default paginate_all cap is too low for that case, so raise
+    # it only when we actually walk everything. Server-side date filtering
+    # doesn't need the higher cap — the result set is already narrow.
+    paginate_max_pages = 1000 if (date_range and not server_side_date) else None
 
     # Strategy for --fuzzy:
-    #   - No pre-existing filter: fold the fuzzy OR-contains filter into body["filter"]
-    #     so the server does the work (cheapest, smallest response).
-    #   - Pre-existing filter: Feishu filters are single-level (no nested AND/OR),
-    #     so we can't express `(fuzzy OR chain) AND (user filter)` server-side.
-    #     Keep the user filter on the server and do the fuzzy pass client-side
-    #     over the already-narrowed result set.
-    #   - --client-fuzzy: always do the fuzzy pass locally, even without a
-    #     pre-existing filter (escape hatch for tables where fuzzy fields
-    #     include lookup/formula types).
+    #   - No pre-existing filter (user filter OR server-side date filter):
+    #     fold the fuzzy OR-contains filter into body["filter"] server-side.
+    #   - Any pre-existing filter: Feishu filters are single-level (no nested
+    #     AND/OR), so we can't express `(fuzzy OR chain) AND (user/date filter)`
+    #     server-side. Keep the prior filter on the server and do the fuzzy
+    #     pass client-side over the already-narrowed result set.
+    #   - --client-fuzzy: always do the fuzzy pass locally (escape hatch).
     apply_client_fuzzy = False
     if fuzzy:
         if client_fuzzy:
             apply_client_fuzzy = True
-        elif filter_obj:
+        elif filter_obj or server_side_date:
             apply_client_fuzzy = True
             emit_warn(
-                "[i] --fuzzy 与 --where/--filter 同时指定：服务端仅执行过滤条件，"
+                "[i] --fuzzy 与 --where/--filter/--date-* 同时指定：服务端仅执行过滤条件，"
                 "模糊搜索在客户端对结果集二次过滤。"
             )
 
     with build_client(ctx) as client:
         # If fuzzy is the ONLY filter, fold it into body server-side.
-        if fuzzy and not client_fuzzy and not filter_obj:
+        if fuzzy and not client_fuzzy and not filter_obj and not server_side_date:
             text_field_names = _fetch_text_field_names(client, token, table_id)
             fuzzy_filter = build_fuzzy_filter(fuzzy, text_field_names)
             if fuzzy_filter:
@@ -338,11 +377,11 @@ def search_records(
         )
         if fuzzy and apply_client_fuzzy:
             items = _client_fuzzy_filter(items, fuzzy)
-        if date_range and date_field:
+        if date_range and date_field and not server_side_date:
             before = len(items)
             items = filter_records_by_date(items, date_field, date_range)
             emit_warn(
-                f"[i] 日期筛选保留 {len(items)}/{before} 条记录"
+                f"[i] 日期客户端筛选保留 {len(items)}/{before} 条记录"
             )
         items = _maybe_expand(client, token, table_id, items, no_expand, only=only)
 

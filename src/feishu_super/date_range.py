@@ -48,6 +48,36 @@ class DateRange:
     def contains(self, ms: int) -> bool:
         return self.start_ms <= ms < self.end_ms
 
+    def to_feishu_filter(self, field_name: str) -> dict[str, Any]:
+        """Build a server-side filter equivalent to [start_ms, end_ms).
+
+        Empirically verified against Feishu's records/search (2026-04):
+          - isGreater(ExactDate, ms)  ==  field's day >= day(ms)   (inclusive!)
+          - isLess(ExactDate, ms)     ==  field's day <  day(ms)   (exclusive)
+          - Comparison is at DAY granularity in the tenant's timezone
+            (Asia/Shanghai for this codebase), not millisecond precision.
+
+        Since start_ms / end_ms are computed by _day_bounds() as exact SH
+        midnight boundaries, passing them through directly gives the intended
+        half-open interval. No -1 shift is needed (and would shift the result
+        by a whole day because of the day-granularity truncation).
+        """
+        return {
+            "conjunction": "and",
+            "conditions": [
+                {
+                    "field_name": field_name,
+                    "operator": "isGreater",
+                    "value": ["ExactDate", str(self.start_ms)],
+                },
+                {
+                    "field_name": field_name,
+                    "operator": "isLess",
+                    "value": ["ExactDate", str(self.end_ms)],
+                },
+            ],
+        }
+
 
 def resolve_tz(tz_name: str | None) -> ZoneInfo:
     try:

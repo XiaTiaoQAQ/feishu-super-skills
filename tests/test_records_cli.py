@@ -163,3 +163,128 @@ def test_parse_expand_only_helper_handles_whitespace_and_empty():
     assert _parse_expand_only("") is None
     assert _parse_expand_only("a, b ,, c") == {"a", "b", "c"}
     assert _parse_expand_only("only_one") == {"only_one"}
+
+
+# ---------------------------------------------------------------------------
+# --date-* server-side filter routing
+# ---------------------------------------------------------------------------
+
+
+def _stub_schema_with_date():
+    return TableSchema(
+        table_id="tbl_src",
+        by_name={
+            "日期": FieldMeta("fld_d", "日期", 5, {}),   # DateTime
+            "状态": FieldMeta("fld_s", "状态", 1, {}),   # Text
+        },
+        by_id={},
+    )
+
+
+@pytest.fixture
+def stub_date_schema(monkeypatch):
+    schema = _stub_schema_with_date()
+    monkeypatch.setattr(records_cmd, "get_table_schema", lambda c, a, t: schema)
+    return schema
+
+
+@pytest.fixture
+def recording_client(monkeypatch):
+    """FakeClient that captures every POST (path, body) so tests can assert
+    exactly what was sent to Feishu. Every POST returns an empty single
+    page so paginate_all terminates immediately."""
+
+    class Recorder:
+        def __init__(self):
+            self.posts: list[tuple[str, Any, dict]] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return None
+
+        def post(self, path, json_body=None, params=None):
+            self.posts.append((path, json_body, dict(params or {})))
+            return {"code": 0, "data": {"items": [], "has_more": False}}
+
+        def get(self, path, params=None):
+            return {"code": 0, "data": {"items": [], "has_more": False}}
+
+    rec = Recorder()
+    monkeypatch.setattr(records_cmd, "build_client", lambda ctx: rec)
+    return rec
+
+
+def test_date_range_goes_server_side_without_user_filter(stub_date_schema, recording_client):
+    result = _runner_invoke(
+        "records", "search", "tbl_src",
+        "--date-field", "日期", "--date-on", "2026-04-22",
+        "--tz", "Asia/Shanghai", "--show", "0", "--no-expand",
+    )
+    assert result.exit_code == 0, result.stderr
+
+    # Exactly one POST to /records/search.
+    search_posts = [p for p in recording_client.posts if p[0].endswith("/records/search")]
+    assert len(search_posts) == 1
+    _path, body, _params = search_posts[0]
+
+    # body.filter must contain isGreater + isLess on the date field with
+    # ExactDate tagged values — this is the server-side path.
+    f = body["filter"]
+    assert f["conjunction"] == "and"
+    ops = {c["operator"] for c in f["conditions"]}
+    assert ops == {"isGreater", "isLess"}
+    for c in f["conditions"]:
+        assert c["field_name"] == "日期"
+        assert c["value"][0] == "ExactDate"
+        assert c["value"][1].isdigit()  # millisecond string
+
+    # Server-side path must NOT emit the client-side fallback warning.
+    assert "回退客户端过滤" not in result.stderr
+    assert "客户端筛选" not in result.stderr
+
+
+def test_date_range_merges_with_and_where(stub_date_schema, recording_client):
+    result = _runner_invoke(
+        "records", "search", "tbl_src",
+        "--where", '状态 = "active"',
+        "--date-field", "日期", "--date-on", "2026-04-22",
+        "--tz", "Asia/Shanghai", "--show", "0", "--no-expand",
+    )
+    assert result.exit_code == 0, result.stderr
+
+    search_posts = [p for p in recording_client.posts if p[0].endswith("/records/search")]
+    body = search_posts[0][1]
+    f = body["filter"]
+    assert f["conjunction"] == "and"
+    # 1 user condition (状态 = active) + 2 date conditions = 3 total.
+    assert len(f["conditions"]) == 3
+    field_ops = [(c["field_name"], c["operator"]) for c in f["conditions"]]
+    assert ("状态", "is") in field_ops
+    assert ("日期", "isGreater") in field_ops
+    assert ("日期", "isLess") in field_ops
+
+
+def test_date_range_falls_back_to_client_on_or_filter(stub_date_schema, recording_client):
+    result = _runner_invoke(
+        "records", "search", "tbl_src",
+        "--where", '状态 = "active" or 状态 = "done"',
+        "--date-field", "日期", "--date-on", "2026-04-22",
+        "--tz", "Asia/Shanghai", "--show", "0", "--no-expand",
+    )
+    assert result.exit_code == 0, result.stderr
+
+    # Fallback path: user filter stays as top-level OR, date conditions NOT merged.
+    search_posts = [p for p in recording_client.posts if p[0].endswith("/records/search")]
+    assert len(search_posts) >= 1
+    body = search_posts[0][1]
+    f = body["filter"]
+    assert f["conjunction"] == "or"
+    # No date conditions injected server-side.
+    for c in f["conditions"]:
+        assert c["field_name"] != "日期"
+
+    # stderr must flag the fallback + the auto-enabled --all.
+    assert "回退客户端过滤" in result.stderr
+    assert "--all" in result.stderr
